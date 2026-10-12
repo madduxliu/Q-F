@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>方為設計 財務管理系統 v3.11.0 雲端版</title>
+    <title>方為設計 財務管理系統 v3.11.1 雲端版</title>
     
     <!-- 延遲載入外部腳本，避免阻塞 -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -5831,6 +5831,7 @@
                 showToast('🔓 管理者模式 — ' + name, 'success');
                 renderRoleBadge();
                 render();
+                _fwOnRoleReady();   // ★ r3-B：補做因「尚未登入」而延後的動作（本機/雲端選擇框、雲端無資料時上傳本機）
             } else if (pw === VIEWER_PASSWORD) {
                 // 訪客登入
                 currentRole = 'viewer';
@@ -5842,14 +5843,11 @@
                 // ★ Build 35 Fix: 訪客登入強制回到儀表板，避免停留在 admin 上次操作的頁面
                 state.currentPage = 'dashboard';
                 try { localStorage.setItem('fangwei_finance_lastPage', 'dashboard'); } catch(e) {}
-                // 訪客自動從雲端載入最新資料
-                if (firebaseEnabled && firebaseDB) {
-                    loadFromCloud(function(ok) {
-                        if (ok) showToast('☁️ 已從雲端載入最新資料', 'success');
-                        render();
-                    });
-                } else {
-                    render();
+                // ★ r3-B：開頁時已自動載入雲端最新資料（見 loadAndSyncOnConnect）→ 訪客登入不再重複覆蓋本機
+                //   （本機若有「晚於雲端」的未上傳變更，更不可覆蓋）；開頁時尚未完成雲端讀取才補做一次
+                render();
+                if (firebaseEnabled && firebaseDB && !_fwSync.checked && !_fwSync.conflict) {
+                    loadAndSyncOnConnect('login');
                 }
             } else {
                 alert('密碼錯誤，請重新輸入');
@@ -5908,6 +5906,9 @@
             if (!firebaseEnabled || !firebaseDB || offlineQueue.length === 0) return;
             // ★ Build 35: 只有 admin 才處理離線佇列（未登入時也跳過）
             if (!isAdmin()) { console.log('⏭️ 非管理者：跳過離線佇列處理'); return; }
+            // ★ r3-B：本機與雲端有待決定的衝突 → 顯示選擇框，不直接上傳；正在讀取雲端時先不動
+            if (_fwSync.conflict) { fwShowStartupChoice(); return; }
+            if (_fwCloudWriteBlocked()) { console.log('⏳ 正在確認雲端現況，稍後再試離線佇列'); return; }
             
             console.log('📤 處理離線佇列：' + offlineQueue.length + ' 個待同步項目');
             
@@ -6240,6 +6241,15 @@
                     return;
                 }
 
+                // ★ r3-B：本機有待 admin 決定的未上傳變更 → 不自動套用，只更新選擇框要顯示的「雲端最新版本」
+                if (_fwSync.conflict) {
+                    _fwSync.conflict.cloud = cloudData;
+                    _fwSync.cloudTs = cloudData.timestamp || null;
+                    _fwSync.cloudBy = cloudData.updatedBy || null;
+                    collaborationState.lastKnownVersion = cloudData.timestamp;
+                    return;
+                }
+
                 // 檢查是否是其他人的更新
                 if (cloudData.sessionId && cloudData.sessionId !== getSessionId()) {
                     // 版本比我們知道的還新
@@ -6258,21 +6268,24 @@
                 }
                 
                 collaborationState.lastKnownVersion = cloudData.timestamp;
+                _fwNoteCloud(cloudData.timestamp, cloudData.updatedBy);   // ★ r3-B：header 的「雲端 MM/DD HH:mm」跟著更新
             });
         }
         
         // 套用雲端資料（深拷貝保護 + try-catch）
-        function applyCloudData(cloudData) {
+        // 回傳 true＝已套用；false＝沒套用（儲存中、或雲端沒有資料）。fallbackYear：雲端資料缺 currentYear 時使用
+        function applyCloudData(cloudData, fallbackYear) {
             // ★★★ Build 33: 正在儲存時不覆蓋 ★★★
             if (_isSaving) {
                 console.log('🔒 applyCloudData: _isSaving=true，跳過雲端覆蓋以保護本地變更');
                 if (cloudData && cloudData.timestamp) {
                     collaborationState.lastKnownVersion = cloudData.timestamp;
                 }
-                return;
+                return false;
             }
             if (cloudData && cloudData.data) {
-                state.data = JSON.parse(JSON.stringify(cloudData.data)); // 深拷貝避免引用
+                // ★ r3-B：深拷貝後補齊必要欄位（沿用 normalizeLoadedData）
+                state.data = _fwNormalizeCloudData(JSON.parse(JSON.stringify(cloudData.data)), fallbackYear || state.data.currentYear || 2026);
                 var year = state.data.currentYear || 2026;
                 try {
                     localStorage.setItem('fangwei_finance_' + year, JSON.stringify(state.data));
@@ -6284,7 +6297,9 @@
                 }
                 collaborationState.hasUnsavedChanges = false;
                 collaborationState.lastKnownVersion = cloudData.timestamp;
-                render();
+                lastCloudSync = new Date();
+                _fwNoteCloud(cloudData.timestamp, cloudData.updatedBy);   // ★ r3-B：header 顯示「雲端 MM/DD HH:mm」
+                _fwRenderKeepLogin();   // = render()；登入框開著時保留已輸入的名稱／密碼
                 
                 // ★★★ 確保圖表也重新渲染 ★★★
                 if (state.currentPage === 'dashboard') {
@@ -6297,7 +6312,9 @@
                 if (state.currentPage === 'income-statement') {
                     setTimeout(function() { renderIncomeChart(); }, 100);
                 }
+                return true;
             }
+            return false;
         }
         
         // 顯示衝突對話框
@@ -6464,6 +6481,9 @@
                 firebaseEnabled = true;
                 cloudSyncStatus = 'connecting';
                 console.log('Firebase 已初始化');
+                // ★ r3-B：雲端資料到達前，header 顯示「正在載入雲端…」；20 秒仍連不上 → 顯示「雲端未連線」（沿用本機資料）
+                _fwSetStatus('loading');
+                setTimeout(function() { if (_fwSync.status === 'loading' && !_fwSync.checked) _fwSetStatus('offline'); }, 20000);
                 
                 // 監聽連線狀態
                 firebaseDB.ref('.info/connected').on('value', function(snap) {
@@ -6476,11 +6496,11 @@
                         if (isAdmin()) updatePresence();
                         listenToPresence();
                         
-                        // ★★★ 關鍵修復：連線後先比較本地與雲端，載入較新的資料 ★★★
-                        loadAndSyncOnConnect();
-                        
-                        // ★★★ 處理離線佇列 ★★★
-                        setTimeout(processOfflineQueue, 2000);
+                        // ★★★ r3-B：連線後立刻讀雲端最新紀錄（不論是否登入、不論角色），雲端為準；
+                        //     本機有「晚於雲端」的離線佇列存檔時例外（見 loadAndSyncOnConnect）。
+                        //     不再於連線後自動處理離線佇列（processOfflineQueue 只在使用者按下 header 的「待同步」標記時執行）★★★
+                        if (_fwSync.status === 'offline') _fwSetStatus(_fwSync.cloudTs ? 'loaded' : 'loading');
+                        loadAndSyncOnConnect('connect');
                         
                         // ★★★ 連線後重新渲染儀表板以更新在線用戶顯示 ★★★
                         if (state.currentPage === 'dashboard') {
@@ -6495,6 +6515,8 @@
                         cloudSyncStatus = 'disconnected';
                         console.log('Firebase 已斷線');
                         renderSyncStatus();
+                        // ★ r3-B：已載入過雲端、之後才斷線 → header 顯示「雲端未連線」（開頁階段的 false 事件維持「正在載入雲端…」）
+                        if (_fwSync.checked && !_fwSync.conflict) _fwSetStatus('offline');
                     }
                 });
                 
@@ -6546,111 +6568,344 @@
         var _lastSyncTime = 0;
         var _isSaving = false; // ★★★ Build 33: 防止 saveData 期間被雲端覆蓋 ★★★
 
-        function loadAndSyncOnConnect() {
-            // ★ Build 35: 尚未登入或訪客模式 → 只監聽不寫入
-            if (!currentRole) {
-                console.log('⏳ loadAndSyncOnConnect: 尚未登入，僅啟動監聽');
-                listenToDataChanges();
+        // ★★★ r3-B：開啟時自動抓雲端最新紀錄 ★★★
+        //  規則：Firebase 連線後（不論登入與否、不論角色）立刻讀 fangwei/finance/<年度>，【雲端為準】：
+        //        套用到 state.data、寫入 localStorage 與 _savedAt（＝cloud.timestamp）、render()、toast。
+        //  唯一例外：離線佇列有「晚於雲端」的存檔（＝本機有尚未上傳成功的變更）
+        //        未登入／訪客 → 不覆蓋本機、不上傳，header 顯示黃色「本機有未上傳變更」；
+        //        admin       → 彈出選擇框（使用雲端最新／上傳本機變更），不自動上傳。
+        //        佇列項目都早於雲端 → 視為過期，清空佇列並載入雲端。
+        //  已移除「本機 savedAt 較新 → 自動上傳」。雲端無資料時才由 admin 上傳本機。
+        //  重新連線（.info/connected 再次 true）、分頁離開超過 60 秒後回到前景 → 同樣檢查，有更新且本機沒有未上傳變更才套用。
+        var _syncLockAt = 0;
+        var _fwSync = {
+            status: 'idle',       // idle | loading | loaded | none | localPending | offline | error
+            checked: false,       // 目前年度是否已完成「開啟時讀取雲端」
+            cloudTs: null,        // 最近一次確認的雲端 timestamp
+            cloudBy: null,
+            cloudEmpty: false,    // 讀到雲端無資料（待 admin 登入後上傳本機）
+            conflict: null,       // { cloud, year, pending } 等待 admin 決定
+            forceUpload: false,   // 使用者在選擇框明確選了「上傳本機」時，saveData 的短暫放行旗標
+            hiddenAt: 0,
+            retryN: 0
+        };
+
+        function _fwTime(ts) { var t = ts ? new Date(ts).getTime() : 0; return isNaN(t) ? 0 : t; }
+        function _fwP2(n) { return String(n).padStart(2, '0'); }
+        // 2026/10/12 08:21
+        function _fwFmtFull(ts) {
+            var t = _fwTime(ts);
+            if (!t) return '未知時間';
+            var d = new Date(t);
+            return d.getFullYear() + '/' + _fwP2(d.getMonth() + 1) + '/' + _fwP2(d.getDate()) + ' ' + _fwP2(d.getHours()) + ':' + _fwP2(d.getMinutes());
+        }
+        // 10/12 08:21
+        function _fwFmtShort(ts) {
+            var t = _fwTime(ts);
+            if (!t) return '';
+            var d = new Date(t);
+            return _fwP2(d.getMonth() + 1) + '/' + _fwP2(d.getDate()) + ' ' + _fwP2(d.getHours()) + ':' + _fwP2(d.getMinutes());
+        }
+
+        // ---- header 同步狀態標籤 ----
+        function _fwCloudLabelHtml() {
+            if (typeof _fwSync === 'undefined' || !_fwSync) return '<span id="cloud-sync-label"></span>';
+            var st = _fwSync.status, base = 'font-size:11px;white-space:nowrap;';
+            if (st === 'loading') {
+                return '<span id="cloud-sync-label" data-state="loading" style="' + base + 'color:#3b82f6"><i class="fas fa-sync-alt fa-spin mr-1"></i>正在載入雲端…</span>';
+            }
+            if (st === 'loaded') {
+                var full = _fwSync.cloudTs ? _fwFmtFull(_fwSync.cloudTs) + ' · by ' + (_fwSync.cloudBy || '未知') : '';
+                return '<span id="cloud-sync-label" data-state="loaded" style="' + base + 'color:#16a34a" title="' + _escAttr(full ? '雲端最後更新：' + full : '已載入雲端資料') + '"><i class="fas fa-cloud mr-1"></i>' +
+                    (_fwSync.cloudTs ? '雲端 ' + _fwFmtShort(_fwSync.cloudTs) : '雲端已載入') + '</span>';
+            }
+            if (st === 'none') {
+                return '<span id="cloud-sync-label" data-state="none" style="' + base + 'color:#64748b"><i class="fas fa-cloud mr-1"></i>雲端尚無資料</span>';
+            }
+            if (st === 'localPending') {
+                return '<span id="cloud-sync-label" data-state="localPending" onclick="fwOnPendingBadge()" style="' + base + 'background:#fef3c7;color:#92400e;border:1px solid #f59e0b;padding:2px 8px;border-radius:4px;cursor:pointer;font-weight:600" title="本機有尚未上傳成功、且比雲端新的變更；系統不會自動上傳或覆蓋">' +
+                    '<i class="fas fa-exclamation-triangle mr-1"></i>本機有未上傳變更</span>';
+            }
+            if (st === 'offline') {
+                return '<span id="cloud-sync-label" data-state="offline" style="' + base + 'color:#94a3b8"><i class="fas fa-cloud mr-1"></i>雲端未連線</span>';
+            }
+            if (st === 'error') {
+                return '<span id="cloud-sync-label" data-state="error" style="' + base + 'color:#ef4444"><i class="fas fa-exclamation-circle mr-1"></i>雲端讀取失敗</span>';
+            }
+            return '<span id="cloud-sync-label"></span>';
+        }
+        function _fwRefreshCloudLabel() {
+            try { var el = document.getElementById('cloud-sync-label'); if (el) el.outerHTML = _fwCloudLabelHtml(); } catch (e) { /* ignore */ }
+        }
+        function _fwSetStatus(st) { _fwSync.status = st; _fwRefreshCloudLabel(); }
+        // 檢查結束但沒有套用時，把「正在載入雲端…」還原成實際狀態
+        function _fwRestoreStatus() { _fwSetStatus(_fwSync.conflict ? 'localPending' : (_fwSync.cloudTs ? 'loaded' : 'idle')); }
+        // 記下「雲端目前的版本」（雲端載入／本機上傳成功／監聽到更新時呼叫）
+        function _fwNoteCloud(ts, by) {
+            if (ts) { _fwSync.cloudTs = ts; _fwSync.cloudBy = by || null; }
+            if (!_fwSync.conflict) _fwSync.status = 'loaded';
+            _fwRefreshCloudLabel();
+        }
+        function fwOnPendingBadge() {
+            if (!_fwSync.conflict) return;
+            if (isAdmin()) fwShowStartupChoice();
+            else showToast('本機有尚未上傳的變更（比雲端新），為避免覆蓋雲端，系統不會自動處理。\n請以管理者身份登入後選擇「使用雲端最新」或「上傳本機變更」。', 'warning');
+        }
+
+        // ---- 離線佇列 ----
+        // 該年度的「存檔」項目（含時間）。時間無法解析者視為最新（寧可保護本機，不可悄悄丟掉）
+        function _fwQueueSaves(year) {
+            var out = [];
+            (offlineQueue || []).forEach(function(it) {
+                if (!it || it.action !== 'save') return;
+                var y = it.data && it.data.year;
+                if (y !== undefined && y !== null && parseInt(y, 10) !== parseInt(year, 10)) return;
+                var ts = (it.data && it.data.timestamp) || it.timestamp;
+                out.push({ ts: ts, time: _fwTime(ts) || Infinity });
+            });
+            return out;
+        }
+        // 有「晚於雲端」的存檔 → { count, latestTs }；否則 null
+        function _fwPendingLocal(year, cloudTime) {
+            var newer = _fwQueueSaves(year).filter(function(s) { return s.time > cloudTime; });
+            if (!newer.length) return null;
+            var latest = newer.reduce(function(a, b) { return b.time > a.time ? b : a; });
+            return { count: newer.length, latestTs: latest.time === Infinity ? null : latest.ts };
+        }
+        // 清掉該年度的存檔項目（其他年度的保留），回傳清掉幾筆
+        function _fwDropQueueSaves(year) {
+            var before = offlineQueue.length;
+            offlineQueue = offlineQueue.filter(function(it) {
+                if (!it || it.action !== 'save') return true;
+                var y = it.data && it.data.year;
+                return (y !== undefined && y !== null && parseInt(y, 10) !== parseInt(year, 10));
+            });
+            try { localStorage.setItem('fangwei_offline_queue', JSON.stringify(offlineQueue)); } catch (e) { console.warn('⚠️ 離線佇列清除失敗:', e); }
+            updateOfflineIndicator();
+            return before - offlineQueue.length;
+        }
+
+        // 雲端寫入是否暫時不可進行：有待 admin 決定的衝突／正在讀取雲端／尚未連上也還沒確認過雲端現況
+        //   → saveData 改存本機＋離線佇列；beforeunload／visibilitychange／processOfflineQueue 不上傳
+        function _fwCloudWriteBlocked() {
+            if (typeof _fwSync === 'undefined') return false;
+            if (_fwSync.forceUpload) return false;
+            if (_fwSync.conflict) return true;
+            if (_syncLock && (Date.now() - _syncLockAt) < 20000) return true;
+            if (!_fwSync.checked && cloudSyncStatus !== 'connected' && cloudSyncStatus !== 'syncing') return true;
+            return false;
+        }
+
+        // 雲端資料補欄位：雲端是權威來源，Firebase 不存空陣列 → projects／customers 缺少代表「空」，不可用內建範例補回
+        function _fwNormalizeCloudData(d, year) {
+            if (d && typeof d === 'object') {
+                if (d.projects === undefined || d.projects === null) d.projects = [];
+                if (d.customers === undefined || d.customers === null) d.customers = [];
+            }
+            return normalizeLoadedData(d, year);
+        }
+
+        // render() 會重建登入框 → 先記下已輸入的名稱／密碼與焦點，重繪後還原（雲端資料常在使用者輸入密碼時到達）
+        function _fwRenderKeepLogin() {
+            var keep = null;
+            try {
+                if (!currentRole && _isLoginModalOpen()) {
+                    var ni = document.getElementById('login-name-input'), pi = document.getElementById('login-password-input');
+                    if (ni && pi) keep = { n: ni.value, p: pi.value, f: document.activeElement ? document.activeElement.id : '' };
+                }
+            } catch (e) { keep = null; }
+            render();
+            if (keep) {
+                try {
+                    var ni2 = document.getElementById('login-name-input'), pi2 = document.getElementById('login-password-input');
+                    if (ni2) ni2.value = keep.n;
+                    if (pi2) pi2.value = keep.p;
+                    if (keep.f === 'login-password-input' && pi2) pi2.focus();
+                    else if (keep.f === 'login-name-input' && ni2) ni2.focus();
+                } catch (e2) { /* ignore */ }
+            }
+        }
+
+        function _fwToastLoaded(cloudData) {
+            showToast('☁️ 已載入雲端最新資料（' + _fwFmtFull(cloudData.timestamp) + ' · by ' + (cloudData.updatedBy || '未知') + '）', 'info');
+        }
+
+        // ---- admin 的選擇框：本機有晚於雲端的未上傳變更 ----
+        function fwShowStartupChoice() {
+            var c = _fwSync.conflict;
+            if (!c || !isAdmin()) return;
+            var cloud = c.cloud || {}, cd = cloud.data || {};
+            var th = 'padding:6px 8px;text-align:left;font-size:12px;color:#475569;background:#f1f5f9;border-bottom:2px solid #cbd5e1';
+            var td = 'padding:8px;border-bottom:1px solid #e2e8f0;font-size:13px';
+            var html = '<div class="p-4" id="fw-startup-choice">' +
+                '<p style="margin:0 0 12px;font-size:13px;color:#92400e;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:10px 12px">' +
+                '這台裝置有 <strong>' + c.pending.count + ' 筆</strong>尚未上傳成功的變更，且時間晚於雲端紀錄。為避免用過期資料覆蓋雲端，系統不會自動上傳，請選擇以哪一份為準：</p>' +
+                '<table style="width:100%;border-collapse:collapse;margin-bottom:14px">' +
+                '<thead><tr style="background:#f1f5f9"><th style="' + th + '"></th><th style="' + th + '">更新時間</th><th style="' + th + '">更新者</th><th style="' + th + '">應收／應付</th></tr></thead><tbody>' +
+                '<tr><td style="' + td + ';font-weight:600">☁️ 雲端</td><td style="' + td + '">' + escapeHtml(_fwFmtFull(cloud.timestamp)) + '</td><td style="' + td + '">' + escapeHtml(cloud.updatedBy || '未知') + '</td>' +
+                '<td style="' + td + '">' + (cd.receivables ? cd.receivables.length : 0) + '／' + (cd.payables ? cd.payables.length : 0) + '</td></tr>' +
+                '<tr><td style="' + td + ';font-weight:600">💾 本機（待上傳）</td><td style="' + td + '">' + escapeHtml(_fwFmtFull(c.pending.latestTs)) + '</td><td style="' + td + '">' + escapeHtml(collaborationState.userName || '本機') + '</td>' +
+                '<td style="' + td + '">' + (state.data.receivables || []).length + '／' + (state.data.payables || []).length + '</td></tr>' +
+                '</tbody></table>' +
+                '<div style="display:grid;gap:10px">' +
+                '<button id="fw-choice-cloud" onclick="fwResolveStartup(\'cloud\')" class="btn" style="background:#3b82f6;color:white;padding:12px"><i class="fas fa-cloud-download-alt mr-2"></i>使用雲端最新（建議）</button>' +
+                '<button id="fw-choice-local" onclick="fwResolveStartup(\'local\')" class="btn" style="background:#f97316;color:white;padding:12px"><i class="fas fa-upload mr-2"></i>上傳本機變更（覆蓋雲端）</button>' +
+                '</div>' +
+                '<p style="margin:10px 0 0;font-size:12px;color:#64748b">「使用雲端」會捨棄本機尚未上傳的變更；「上傳本機」會以本機資料覆蓋雲端（其他裝置較新的變更將消失）。關閉此視窗不會做任何事，header 的黃色標記可再次開啟。</p>' +
+                '</div>';
+            showModal('☁️ 雲端與本機資料不同', html, 'modal-sm');
+        }
+
+        // 選擇結果（僅 admin）
+        function fwResolveStartup(choice) {
+            if (!isAdmin()) { showToast(typeof READONLY_TOAST_MSG !== 'undefined' ? READONLY_TOAST_MSG : '訪客模式：唯讀，無法變更資料', 'warning'); return; }
+            var c = _fwSync.conflict;
+            if (!c) { closeModal(); return; }
+            if (_isSaving) { showToast('⏳ 正在儲存中，請稍後再試一次', 'warning'); return; }
+            var year = c.year;
+            closeModal();
+            _fwSync.conflict = null;
+            _fwDropQueueSaves(year);
+            if (choice === 'cloud') {
+                applyCloudData(c.cloud, year);
+                _fwSync.checked = true;
+                _fwToastLoaded(c.cloud);
+            } else if (choice === 'local') {
+                _fwSync.checked = true;
+                collaborationState.lastKnownVersion = null;
+                _fwSync.forceUpload = true;
+                try { saveData(true); } finally { _fwSync.forceUpload = false; }
+                showToast('☁️ 已上傳本機變更，覆蓋雲端', 'success');
+            }
+            _fwRefreshCloudLabel();
+        }
+
+        // 登入完成後（admin／訪客）呼叫：補做因「尚未登入」而延後的動作
+        function _fwOnRoleReady() {
+            if (!firebaseEnabled || !firebaseDB || !isAdmin()) { _fwRefreshCloudLabel(); return; }
+            if (_fwSync.conflict) { fwShowStartupChoice(); return; }
+            if (_fwSync.checked && _fwSync.cloudEmpty) {
+                _fwSync.cloudEmpty = false;
+                console.log('☁️ 雲端無資料，管理者已登入，將本地資料上傳');
+                saveData();
+            }
+        }
+
+        // ---- 讀到雲端資料後的處理 ----
+        function _fwHandleCloudSnapshot(cloudData, year, reason) {
+            if (!cloudData || !cloudData.data) {
+                // 雲端無資料：只有 admin 才上傳本機（未登入／訪客待 admin 登入後由 _fwOnRoleReady 上傳）
+                _fwSync.checked = true;
+                _fwSync.cloudTs = null;
+                _fwSync.conflict = null;
+                _fwSetStatus('none');
+                if (isAdmin()) {
+                    console.log('☁️ 雲端無資料，將本地資料上傳');
+                    _fwSync.cloudEmpty = false;
+                    saveData();
+                } else {
+                    _fwSync.cloudEmpty = true;
+                    console.log('👁️ 雲端無資料；非管理者不上傳（待管理者登入後再上傳）');
+                }
                 return;
+            }
+            _fwSync.cloudEmpty = false;
+            var cloudTime = _fwTime(cloudData.timestamp);
+            var startup = !_fwSync.checked;
+            console.log('📊 雲端資料（' + reason + '）：', _fwFmtFull(cloudData.timestamp), 'by', cloudData.updatedBy || '未知');
+
+            // 例外：離線佇列有「晚於雲端」的存檔 → 本機有未上傳變更：不覆蓋、不上傳
+            var pending = _fwPendingLocal(year, cloudTime);
+            if (pending) {
+                _fwSync.checked = true;
+                _fwSync.cloudTs = cloudData.timestamp || null;
+                _fwSync.cloudBy = cloudData.updatedBy || null;
+                _fwSync.conflict = { cloud: cloudData, year: year, pending: pending };
+                collaborationState.lastKnownVersion = cloudData.timestamp;
+                _fwSetStatus('localPending');
+                console.log('💾 本機有 ' + pending.count + ' 筆晚於雲端的待同步變更：不覆蓋、不上傳');
+                if (isAdmin() && !state.modal) fwShowStartupChoice();
+                return;
+            }
+
+            _fwSync.conflict = null;
+            if (!startup) {
+                // 重新連線／回到前景：雲端比本機新、且本機沒有未上傳變更才套用
+                var localTime = _fwTime(localStorage.getItem('fangwei_finance_' + year + '_savedAt'));
+                if (cloudTime <= localTime) { _fwNoteCloud(cloudData.timestamp, cloudData.updatedBy); return; }
+                if (collaborationState.hasUnsavedChanges) {
+                    _fwRestoreStatus();
+                    if (isAdmin()) showConflictDialog(cloudData);
+                    return;
+                }
+                if (state.modal && _modalDirty) {
+                    console.log('✍️ 使用者正在編輯視窗，暫不套用雲端更新');
+                    _fwRestoreStatus();
+                    return;
+                }
+            }
+            var dropped = _fwDropQueueSaves(year);
+            if (dropped) console.log('🧹 離線佇列 ' + dropped + ' 筆存檔早於雲端，視為過期已清空');
+            if (applyCloudData(cloudData, year)) {
+                _fwSync.checked = true;
+                _fwToastLoaded(cloudData);
+            } else {
+                // 正在儲存中等原因沒套用 → 不標記完成，下次重新連線／回到前景再試
+                _fwRestoreStatus();
+            }
+        }
+
+        // reason：connect（.info/connected true）| switchYear | visible（回到前景）| login | retry
+        function loadAndSyncOnConnect(reason) {
+            if (!firebaseEnabled || !firebaseDB) return;
+            reason = reason || 'connect';
+            if (reason === 'switchYear') {
+                // 換年度＝重新做一次「開啟時讀取雲端」
+                _fwSync.checked = false; _fwSync.conflict = null; _fwSync.cloudEmpty = false; _fwSync.cloudTs = null; _fwSync.cloudBy = null; _fwSync.retryN = 0;
             }
             var now = Date.now();
             // ★★★ Build 33: 如果正在儲存中，不要讀雲端覆蓋 ★★★
             if (_isSaving) {
                 console.log('🔒 loadAndSyncOnConnect: _isSaving=true，跳過雲端同步以防覆蓋');
                 listenToDataChanges();
+                if (!_fwSync.checked && _fwSync.retryN < 5) {
+                    _fwSync.retryN++;
+                    setTimeout(function() { loadAndSyncOnConnect('retry'); }, 1500);
+                }
                 return;
             }
-            // 5 秒內不重複同步（防止 confirm 對話框導致短暫斷線→重連→覆蓋資料）
-            if (_syncLock || (now - _lastSyncTime < 5000)) {
+            if (_syncLock && (now - _syncLockAt) > 20000) _syncLock = false;   // 讀取卡住太久視為失效
+            var forced = (reason !== 'connect');
+            // 連線事件 5 秒內不重複同步（防止 confirm 對話框導致短暫斷線→重連→覆蓋資料）
+            if (_syncLock || (!forced && (now - _lastSyncTime < 5000))) {
                 console.log('⏳ loadAndSyncOnConnect 被防抖跳過');
                 listenToDataChanges();
                 return;
             }
             _syncLock = true;
+            _syncLockAt = now;
             _lastSyncTime = now;
 
             var year = state.data.currentYear || 2026;
+            if (!_fwSync.conflict) _fwSetStatus('loading');
 
             firebaseDB.ref('fangwei/finance/' + year).once('value').then(function(snap) {
-                var cloudData = snap.val();
-
-                if (!cloudData || !cloudData.data) {
-                    // ★ Build 35: 只有 admin 才自動上傳
-                    if (isAdmin()) {
-                        console.log('☁️ 雲端無資料，將本地資料上傳');
-                        saveData();
-                    } else {
-                        console.log('👁️ 訪客模式：雲端無資料，不上傳');
-                    }
+                _syncLock = false;
+                if ((state.data.currentYear || 2026) !== year) {
+                    // 讀取期間使用者已切換年度 → 這份資料不適用，對新年度重做一次
                     listenToDataChanges();
+                    setTimeout(function() { loadAndSyncOnConnect('retry'); }, 0);
                     return;
                 }
-
-                // 比較時間戳
-                var cloudTime = cloudData.timestamp ? new Date(cloudData.timestamp).getTime() : 0;
-                var localSavedAt = localStorage.getItem('fangwei_finance_' + year + '_savedAt');
-                var localTime = localSavedAt ? new Date(localSavedAt).getTime() : 0;
-
-                console.log('📊 資料比較：');
-                console.log('  雲端時間:', cloudTime ? new Date(cloudTime).toLocaleString() : '無');
-                console.log('  本地時間:', localTime ? new Date(localTime).toLocaleString() : '無');
-                console.log('  雲端更新者:', cloudData.updatedBy || '未知');
-
-                // ★★★ 額外檢查：如果有待同步的離線佇列，代表本地有未上傳的變更，不覆蓋 ★★★
-                var hasOfflineChanges = offlineQueue && offlineQueue.length > 0;
-
-                if (cloudTime > localTime && !hasOfflineChanges) {
-                    // 雲端較新且本地無待同步變更，載入雲端資料
-                    console.log('☁️ 雲端資料較新，載入雲端版本');
-                    state.data = JSON.parse(JSON.stringify(cloudData.data)); // 深拷貝
-                    try {
-                        localStorage.setItem('fangwei_finance_' + year, JSON.stringify(state.data));
-                        localStorage.setItem('fangwei_finance_' + year + '_savedAt', cloudData.timestamp);
-                    } catch (e) { console.error('localStorage 寫入失敗:', e); }
-                    collaborationState.lastKnownVersion = cloudData.timestamp;
-                    collaborationState.hasUnsavedChanges = false;
-                    render();
-
-                    if (state.currentPage === 'dashboard') {
-                        setTimeout(function() {
-                            try { renderCashFlowChart(); } catch (e) { console.warn('renderCashFlowChart 失敗:', e); }
-                            try { renderExpensePieChart(); } catch (e) { console.warn('renderExpensePieChart 失敗:', e); }
-                            try { renderMonthlyTrendChart(); } catch (e) { console.warn('renderMonthlyTrendChart 失敗:', e); }
-                        }, 100);
-                    }
-                    if (state.currentPage === 'income-statement') {
-                        setTimeout(function() { renderIncomeChart(); }, 100);
-                    }
-
-                    showToast('☁️ 已從雲端載入最新資料 (by ' + (cloudData.updatedBy || '其他使用者') + ')', 'info');
-                } else {
-                    if (hasOfflineChanges) {
-                        console.log('💾 本地有 ' + offlineQueue.length + ' 筆待同步變更，保持本地版本');
-                    } else {
-                        console.log('💾 本地資料較新或相同，保持本地版本');
-                    }
-                    collaborationState.lastKnownVersion = cloudData.timestamp;
-                    // 本地較新時主動上傳（★ Build 35: 只有 admin 才上傳）
-                    if (localTime > cloudTime && isAdmin()) {
-                        console.log('📤 本地較新，主動上傳至雲端');
-                        saveData(true);
-                    } else if (isViewer() && cloudTime > localTime) {
-                        // ★ Build 35: 訪客自動載入雲端較新版本
-                        console.log('👁️ 訪客模式：雲端較新，自動載入');
-                        state.data = JSON.parse(JSON.stringify(cloudData.data));
-                        try { localStorage.setItem('fangwei_finance_' + year, JSON.stringify(state.data)); } catch(e2) {}
-                        render();
-                        showToast('☁️ 已從雲端載入最新資料', 'info');
-                    }
-                }
-
+                _fwHandleCloudSnapshot(snap.val(), year, reason);
                 // 開始監聽後續變化
                 listenToDataChanges();
-                _syncLock = false; // 處理完成後才釋放鎖
-
             }).catch(function(e) {
                 _syncLock = false;
                 console.error('❌ 連線時同步失敗:', e);
+                // 讀取失敗（例如規則拒絕）→ 無法確認雲端現況，維持舊行為不擋寫入
+                _fwSync.checked = true;
+                if (!_fwSync.conflict) _fwSetStatus(_fwSync.cloudTs ? 'loaded' : 'error');
                 listenToDataChanges();
             });
         }
@@ -6679,10 +6934,14 @@
         //  + 專案清單：母案/追加子案階層顯示（↳ 追加、+N 追加、母案未建立）
         //  * 主案匯入：金額改用報價系統 financeSummary（payBasis / totalCost / receivables），重複匯入可取代未收付帳款，
         //    來源改為 localStorage 與 Firebase 取較新的 savedAt，預覽成本含抽屜/層板五金
+        // r3-B（開啟時自動抓雲端最新紀錄）:
+        //  * 連線後不分登入／角色立刻讀 fangwei/finance/<年度>，雲端為準（loadAndSyncOnConnect → _fwHandleCloudSnapshot）；移除「本機較新就自動上傳」
+        //  * 例外：離線佇列有晚於雲端的存檔 → 不覆蓋、不上傳（未登入／訪客：header 黃色標記；admin：選擇框 fwShowStartupChoice）
+        //  * 重新連線／分頁離開 >60 秒回到前景 → 同樣檢查；header 顯示「正在載入雲端…」→「雲端 MM/DD HH:mm」
         var APP_VERSION = {
             major: 3,
             minor: 11,
-            patch: 0,
+            patch: 1,
             build: parseInt(localStorage.getItem('fangwei_finance_build') || '36', 10),
             platform: 'Desktop'  // 桌面版本標記
         };
@@ -7024,8 +7283,8 @@
                 showToast('⚠️ 本地儲存失敗（可能儲存空間不足），資料僅保留在記憶體中', 'warning');
             }
 
-            // 雲端同步
-            if (firebaseEnabled && firebaseDB) {
+            // 雲端同步（★ r3-B：有待決定的衝突／正在讀取雲端時不上傳，改存離線佇列，由使用者決定後再處理）
+            if (firebaseEnabled && firebaseDB && !_fwCloudWriteBlocked()) {
                 cloudSyncStatus = 'syncing';
                 renderSyncStatus();
 
@@ -7054,6 +7313,7 @@
                     collaborationState.hasUnsavedChanges = false;
                     _isSaving = false; // ★★★ Build 33: 釋放儲存鎖 ★★★
                     renderSyncStatus();
+                    _fwNoteCloud(timestamp, collaborationState.userName);   // ★ r3-B：header「雲端 MM/DD HH:mm」
                     console.log('💾 saveData 完成 (_isSaving=false) - Build ' + APP_VERSION.build);
 
                     // ★★★ Build 34: 同步供應商主檔到共用路徑，供報價系統讀取 ★★★
@@ -7078,7 +7338,7 @@
                     addToOfflineQueue('save', { year: year, data: dataSnapshot, timestamp: timestamp });
                 });
             } else {
-                // ★★★ 離線模式：儲存深拷貝資料 ★★★
+                // ★★★ 離線模式（或 r3-B 暫停雲端寫入）：儲存深拷貝資料 ★★★
                 _isSaving = false; // ★★★ Build 33: 無 Firebase 時立即釋放 ★★★
                 collaborationState.hasUnsavedChanges = false;
                 try {
@@ -7115,6 +7375,11 @@
                     cloudSyncStatus = 'connected';
                     lastCloudSync = new Date();
                     renderSyncStatus();
+                    // ★ r3-B：使用者明確要求「載入雲端最新」→ 本機待上傳的變更一併捨棄，並結束待決定的衝突狀態
+                    _fwSync.conflict = null;
+                    _fwSync.checked = true;
+                    _fwDropQueueSaves(year);
+                    _fwNoteCloud(cloudData.timestamp, cloudData.updatedBy);
                     render();
                     if (callback) callback(true);
                     console.log('已從雲端載入資料');
@@ -7169,6 +7434,9 @@
             // ★ Build 35: 訪客模式不上傳到雲端
             if (!isAdmin()) { console.log('⏭️ 非管理者：beforeunload 跳過雲端儲存'); return; }
 
+            // ★ r3-B：有待決定的衝突／尚未確認雲端現況 → 不上傳本機資料（避免用過期資料覆蓋雲端）
+            if (_fwCloudWriteBlocked()) { console.log('⏭️ 雲端寫入暫停中（待確認雲端現況）：beforeunload 跳過雲端儲存'); return; }
+
             // 如果有Firebase連線，同步儲存（使用深拷貝）
             if (firebaseEnabled && firebaseDB) {
                 try {
@@ -7209,6 +7477,8 @@
 
                 // ★ Build 35: 非管理者不上傳到雲端
                 if (!isAdmin()) return;
+                // ★ r3-B：有待決定的衝突／尚未確認雲端現況 → 不上傳本機資料
+                if (_fwCloudWriteBlocked()) { console.log('⏭️ 雲端寫入暫停中（待確認雲端現況）：visibilitychange 跳過雲端儲存'); return; }
 
                 if (firebaseEnabled && firebaseDB) {
                     try {
@@ -7227,6 +7497,18 @@
                     }
                 }
                 console.log('頁面隱藏，資料已儲存');
+            }
+        });
+
+        // ★ r3-B：分頁離開超過 60 秒後回到前景（例如 iPad 喚醒）→ 重新檢查雲端；有更新且本機沒有未上傳變更才自動套用
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'hidden') { _fwSync.hiddenAt = Date.now(); return; }
+            if (document.visibilityState !== 'visible') return;
+            var away = _fwSync.hiddenAt ? (Date.now() - _fwSync.hiddenAt) : 0;
+            _fwSync.hiddenAt = 0;
+            if (away > 60000 && firebaseEnabled && firebaseDB && !window.__fwResetting) {
+                console.log('👀 分頁回到前景（離開 ' + Math.round(away / 1000) + ' 秒）→ 檢查雲端更新');
+                loadAndSyncOnConnect('visible');
             }
         });
         
@@ -8262,6 +8544,7 @@
                 '<span id="role-badge"></span>' +
                 offlineQueueHtml +
                 onlineUsersHtml +
+                _fwCloudLabelHtml() +
                 cloudIcon +
                 '<span class="mr-2"><i class="fas fa-clock mr-1"></i>' + nowStr + '</span>' +
                 '<span><i class="fas fa-calendar-alt mr-1"></i>' + (state.data.currentYear - 1911) + '年度</span>' +
@@ -18008,9 +18291,9 @@
             }
             state.data.currentYear = year;
             
-            // ★★★ 重新同步新年度資料 ★★★
+            // ★★★ 重新同步新年度資料（★ r3-B：換年度＝重新做一次「讀取雲端、雲端為準」）★★★
             if (firebaseEnabled && firebaseDB) {
-                loadAndSyncOnConnect();
+                loadAndSyncOnConnect('switchYear');
             } else {
                 saveData();
             }
@@ -19464,6 +19747,11 @@
                 collaborationState.lastKnownVersion = timestamp;
                 collaborationState.hasUnsavedChanges = false;
                 try { localStorage.setItem('fangwei_finance_' + year + '_savedAt', timestamp); } catch (e) { /* ignore */ }
+                // ★ r3-B：使用者明確「強制上傳」→ 結束待決定的衝突狀態、清掉已被覆蓋的待同步項目
+                _fwSync.conflict = null;
+                _fwSync.checked = true;
+                _fwDropQueueSaves(year);
+                _fwNoteCloud(timestamp, collaborationState.userName);
                 renderSyncStatus();
                 showToast('✅ 已上傳至雲端，並建立版本快照', 'success');
                 logActivity('sync', '雲端同步', '強制上傳至雲端 + 版本快照');
